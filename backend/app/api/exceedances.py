@@ -92,9 +92,25 @@ def annotate_exceedance(exceedance_id):
     return updated.to_dict()
 
 
+@bp.get("/ids")
+def exceedance_ids():
+    """当前筛选条件下的全部记录 id, 供工作台跨页全选."""
+    return exceedance_service.matching_ids(request.args)
+
+
+@bp.get("/annotations/<request_id>")
+def get_annotation_batch(request_id):
+    """按幂等键查询批量操作结果 (审计追溯)."""
+    return exceedance_service.get_batch(request_id)
+
+
 @bp.post("/annotations")
 def batch_annotate():
-    """批量标注: 工作台勾选多条后一次性确认或忽略."""
+    """批量标注: 工作台勾选多条后一次性确认或忽略.
+
+    mode=atomic 任一记录不可处理则整批不生效; mode=partial 逐条处理并在
+    响应中给出失败原因. request_id 为幂等键, 重复提交只产生一次处理结果.
+    """
     data = json_payload()
     validator = Validator(data)
     status = validator.choice(
@@ -105,7 +121,14 @@ def batch_annotate():
     )
     note = validator.text("note", "标注说明", required=False, max_length=1000)
     annotator = validator.text("annotator", "标注人", required=False, max_length=64)
+    mode = validator.choice(
+        "mode", "批量模式", choices=("atomic", "partial"), required=False, default="atomic"
+    )
+    request_id = validator.text("request_id", "请求标识", required=False, max_length=64)
     validator.raise_if_invalid("标注信息不合法")
 
     ids = list_payload("ids", data)
-    return exceedance_service.annotate_batch(ids, status, note=note, annotator=annotator, level=level)
+    return exceedance_service.annotate_batch(
+        ids, status, note=note, annotator=annotator, level=level,
+        mode=mode or "atomic", request_id=request_id,
+    )

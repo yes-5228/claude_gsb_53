@@ -1,16 +1,19 @@
 """超标记录查询与人工标注."""
+import uuid
 from datetime import datetime
 
 from sqlalchemy import cast, func, or_
+from sqlalchemy.exc import IntegrityError
 
 from ..domain.constants import EXCEEDANCE_LEVEL_LABELS, EXCEEDANCE_STATUS_LABELS
 from ..errors import NotFoundError, ValidationError
 from ..extensions import db
-from ..models import Exceedance, Measurement, Station
+from ..models import AnnotationBatch, Exceedance, Measurement, Station
 from ..models.base import iso
 
 STATUS_CHOICES = tuple(EXCEEDANCE_STATUS_LABELS.keys())
 LEVEL_CHOICES = tuple(EXCEEDANCE_LEVEL_LABELS.keys())
+BATCH_MODES = ("atomic", "partial")
 
 
 def _split(value):
@@ -138,8 +141,57 @@ def annotate(exceedance, status=None, note=None, annotator=None, level=None):
     return exceedance
 
 
-def annotate_batch(ids, status, note=None, annotator=None, level=None):
-    """Batch annotation used by the exceedance work bench."""
+def _snapshot(record):
+    """Annotation-relevant fields, used for before/after comparison."""
+    return {
+        "status": record.status,
+        "level": record.level,
+        "note": record.note,
+        "annotator": record.annotator,
+        "annotated_at": iso(record.annotated_at),
+    }
+
+
+def _validate_batch_payload(status, note, annotator):
+    """Every batch operation must record operator; confirm/ignore need a note."""
+    if not (annotator or "").strip():
+        raise ValidationError(
+            "批量操作必须填写标注人, 便于追溯", fields={"annotator": "required"}
+        )
+    if status != "pending" and not (note or "").strip():
+        raise ValidationError(
+            "批量标注为\"%s\"时必须填写标注说明"
+            % EXCEEDANCE_STATUS_LABELS.get(status, status),
+            fields={"note": "required"},
+        )
+
+
+def annotate_batch(ids, status, note=None, annotator=None, level=None,
+                   mode="atomic", request_id=None):
+    """Batch annotation used by the exceedance work bench.
+
+    - ``mode="atomic"``: any record that cannot be processed aborts the whole
+      batch (nothing is written) and the error explains which ids failed.
+    - ``mode="partial"``: process what can be processed; the response carries
+      per-item results with reasons for every skipped record.
+    - ``request_id``: idempotency key. Resubmitting the same key returns the
+      first stored result (``deduplicated=True``) without touching the records.
+    """
+    if mode not in BATCH_MODES:
+        raise ValidationError(
+            "批量模式取值不合法, 可选: %s" % ", ".join(BATCH_MODES),
+            fields={"mode": "unknown"},
+        )
+
+    request_id = (request_id or "").strip() or uuid.uuid4().hex
+    existing = AnnotationBatch.query.filter_by(request_id=request_id).first()
+    if existing is not None:
+        result = existing.to_dict()
+        result["deduplicated"] = True
+        return result
+
+    _validate_batch_payload(status, note, annotator)
+
     ids = list(dict.fromkeys(int(item) for item in ids))
     if not ids:
         raise ValidationError("请至少选择一条超标记录", fields={"ids": "empty"})
@@ -148,33 +200,106 @@ def annotate_batch(ids, status, note=None, annotator=None, level=None):
     found = {record.id for record in records}
     missing = [item for item in ids if item not in found]
 
-    updated = []
+    if missing and mode == "atomic":
+        raise ValidationError(
+            "有 %d 条记录不存在 (%s), 整批未生效, 请刷新后重新勾选"
+            % (len(missing), ", ".join(str(item) for item in missing[:10])),
+            fields={"ids": "missing", "missing": missing},
+        )
+
+    note = (note or "").strip()
+    annotator = annotator.strip()
+    now = datetime.now()
+
+    items = []
+    updated_ids = []
     for record in records:
-        annotate_silent = {
-            "status": status if status is not None else record.status,
-            "level": level if level is not None else record.level,
-            "note": note,
-            "annotator": annotator,
-        }
-        if annotate_silent["status"] != "pending" and not (note or "").strip():
-            raise ValidationError(
-                "批量标注为\"%s\"时必须填写标注说明"
-                % EXCEEDANCE_STATUS_LABELS.get(annotate_silent["status"], annotate_silent["status"]),
-                fields={"note": "required"},
-            )
-        record.status = annotate_silent["status"]
-        record.level = annotate_silent["level"]
-        if (note or "").strip():
-            record.note = note.strip()
-        if annotate_silent["status"] == "pending":
+        before = _snapshot(record)
+        record.status = status
+        if level is not None:
+            record.level = level
+        if note:
+            record.note = note
+        if status == "pending":
             record.annotated_at = None
         else:
-            record.annotator = annotator or record.annotator or "未署名"
-            record.annotated_at = datetime.now()
-        updated.append(record.id)
+            record.annotator = annotator
+            record.annotated_at = now
+        after = _snapshot(record)
+        items.append({
+            "id": record.id,
+            "result": "updated",
+            "changed": before != after,
+            "reannotated": before["annotated_at"] is not None,
+            "before": before,
+            "after": after,
+            "station_name": record.station.name if record.station else None,
+            "pollutant": record.pollutant,
+            "measured_at": iso(record.measured_at),
+        })
+        updated_ids.append(record.id)
+    for item in missing:
+        items.append({"id": item, "result": "missing", "reason": "记录不存在或已被删除"})
 
-    db.session.commit()
-    return {"updated": len(updated), "updated_ids": updated, "missing": missing}
+    result = {
+        "request_id": request_id,
+        "mode": mode,
+        "deduplicated": False,
+        "status": status,
+        "level": level,
+        "note": note or None,
+        "annotator": annotator,
+        "requested": len(ids),
+        "updated": len(updated_ids),
+        "updated_ids": updated_ids,
+        "missing": missing,
+        "failed": [{"id": item, "reason": "记录不存在或已被删除"} for item in missing],
+        "items": items,
+        "processed_at": iso(now),
+    }
+
+    batch = AnnotationBatch(
+        request_id=request_id,
+        mode=mode,
+        status=status,
+        level=level,
+        note=note or None,
+        annotator=annotator,
+        requested=len(ids),
+        updated=len(updated_ids),
+        result=result,
+    )
+    db.session.add(batch)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # Concurrent duplicate submission: the first one won, replay its result.
+        db.session.rollback()
+        winner = AnnotationBatch.query.filter_by(request_id=request_id).first()
+        if winner is None:
+            raise
+        result = winner.to_dict()
+        result["deduplicated"] = True
+        return result
+    return result
+
+
+def get_batch(request_id):
+    batch = AnnotationBatch.query.filter_by(request_id=(request_id or "").strip()).first()
+    if batch is None:
+        raise NotFoundError("批量操作记录不存在: request_id=%s" % request_id)
+    return batch.to_dict()
+
+
+def matching_ids(args):
+    """All exceedance ids matching the current filters (for cross-page select all)."""
+    from flask import current_app
+
+    limit = current_app.config["MAX_BATCH_SIZE"]
+    query = exceedance_query(args).with_entities(Exceedance.id)
+    total = query.count()
+    ids = [row[0] for row in query.limit(limit).all()]
+    return {"ids": ids, "total": total, "truncated": total > limit}
 
 
 def summary(args):

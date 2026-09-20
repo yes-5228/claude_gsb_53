@@ -4,6 +4,9 @@ export const listExceedances = (params) => http.get('/exceedances', { params: to
 export const getExceedance = (id) => http.get(`/exceedances/${id}`)
 export const annotateExceedance = (id, payload) => http.patch(`/exceedances/${id}`, payload)
 export const batchAnnotate = (payload) => http.post('/exceedances/annotations', payload)
+export const getAnnotationBatch = (requestId) => http.get(`/exceedances/annotations/${requestId}`)
+export const fetchExceedanceIds = (params) =>
+  http.get('/exceedances/ids', { params: toParams(params) })
 export const exceedanceSummary = (params) =>
   http.get('/exceedances/summary', { params: toParams(params) })
 export const exceedanceOptions = () => http.get('/exceedances/options')
