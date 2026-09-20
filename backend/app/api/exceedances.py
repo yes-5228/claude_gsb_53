@@ -70,6 +70,20 @@ def get_exceedance(exceedance_id):
     return exceedance.to_dict(include_relations=True)
 
 
+@bp.get("/<int:exceedance_id>/annotations")
+def exceedance_annotations(exceedance_id):
+    """单条记录的标注历史: 每次标注的前后值对照."""
+    return exceedance_service.annotation_history(exceedance_id)
+
+
+@bp.get("/batches")
+def annotation_batches():
+    """最近的批量标注操作记录 (操作人/说明/处理结果)."""
+    from ..utils.pagination import arg_int
+
+    return exceedance_service.recent_batches(arg_int("limit", 20))
+
+
 @bp.patch("/<int:exceedance_id>")
 def annotate_exceedance(exceedance_id):
     """单条标注: 确认/忽略/调整等级并填写说明."""
@@ -94,7 +108,10 @@ def annotate_exceedance(exceedance_id):
 
 @bp.post("/annotations")
 def batch_annotate():
-    """批量标注: 工作台勾选多条后一次性确认或忽略."""
+    """批量标注: 工作台勾选多条后一次性确认或忽略.
+
+    携带 batch_id 时按幂等处理: 同一批次重复提交只产生一次处理结果.
+    """
     data = json_payload()
     validator = Validator(data)
     status = validator.choice(
@@ -105,7 +122,10 @@ def batch_annotate():
     )
     note = validator.text("note", "标注说明", required=False, max_length=1000)
     annotator = validator.text("annotator", "标注人", required=False, max_length=64)
+    batch_key = validator.text("batch_id", "批次号", required=False, max_length=64)
     validator.raise_if_invalid("标注信息不合法")
 
     ids = list_payload("ids", data)
-    return exceedance_service.annotate_batch(ids, status, note=note, annotator=annotator, level=level)
+    return exceedance_service.annotate_batch(
+        ids, status, note=note, annotator=annotator, level=level, batch_key=batch_key
+    )

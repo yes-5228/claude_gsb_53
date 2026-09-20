@@ -1,12 +1,14 @@
 """超标记录查询与人工标注."""
+import json
 from datetime import datetime
 
 from sqlalchemy import cast, func, or_
+from sqlalchemy.exc import IntegrityError
 
 from ..domain.constants import EXCEEDANCE_LEVEL_LABELS, EXCEEDANCE_STATUS_LABELS
 from ..errors import NotFoundError, ValidationError
 from ..extensions import db
-from ..models import Exceedance, Measurement, Station
+from ..models import AnnotationBatch, Exceedance, ExceedanceAnnotation, Measurement, Station
 from ..models.base import iso
 
 STATUS_CHOICES = tuple(EXCEEDANCE_STATUS_LABELS.keys())
@@ -101,8 +103,42 @@ def exceedance_query(args):
     return query.order_by(primary, Exceedance.id.desc())
 
 
+def _snapshot(exceedance):
+    """Capture the annotation fields before a change, for history diffing."""
+    return {
+        "status": exceedance.status,
+        "level": exceedance.level,
+        "note": exceedance.note,
+        "annotator": exceedance.annotator,
+    }
+
+
+def _record_history(exceedance, prev, *, source, batch=None, note=None, annotator=None):
+    entry = ExceedanceAnnotation(
+        exceedance_id=exceedance.id,
+        source=source,
+        annotator=annotator,
+        note=note,
+        prev_status=prev["status"],
+        prev_level=prev["level"],
+        prev_note=prev["note"],
+        prev_annotator=prev["annotator"],
+        new_status=exceedance.status,
+        new_level=exceedance.level,
+        new_note=exceedance.note,
+    )
+    if batch is not None:
+        entry.batch = batch
+    db.session.add(entry)
+    return entry
+
+
 def annotate(exceedance, status=None, note=None, annotator=None, level=None):
     """Apply a manual annotation to an exceedance record."""
+    prev = _snapshot(exceedance)
+    note_text = (note or "").strip()
+    annotator_text = (annotator or "").strip()
+
     if status is not None:
         if status not in STATUS_CHOICES:
             raise ValidationError(
@@ -118,63 +154,185 @@ def annotate(exceedance, status=None, note=None, annotator=None, level=None):
             )
         exceedance.level = level
 
-    note = (note or "").strip()
     if exceedance.status == "pending":
-        exceedance.note = note or exceedance.note
-        exceedance.annotator = annotator or exceedance.annotator
-        exceedance.annotated_at = None if not note else datetime.now()
+        exceedance.note = note_text or exceedance.note
+        exceedance.annotator = annotator_text or exceedance.annotator
+        exceedance.annotated_at = None if not note_text else datetime.now()
     else:
-        if not note:
+        if not note_text:
             reason = "确认" if exceedance.status == "confirmed" else "忽略"
             raise ValidationError(
                 "标注为\"%s\"时必须填写%s原因" % (EXCEEDANCE_STATUS_LABELS[exceedance.status], reason),
                 fields={"note": "required"},
             )
-        exceedance.note = note
-        exceedance.annotator = annotator or "未署名"
+        exceedance.note = note_text
+        exceedance.annotator = annotator_text or "未署名"
         exceedance.annotated_at = datetime.now()
 
+    _record_history(
+        exceedance,
+        prev,
+        source="single",
+        note=note_text or None,
+        annotator=annotator_text or None,
+    )
     db.session.commit()
     return exceedance
 
 
-def annotate_batch(ids, status, note=None, annotator=None, level=None):
-    """Batch annotation used by the exceedance work bench."""
-    ids = list(dict.fromkeys(int(item) for item in ids))
+def _replay_result(batch):
+    """Stored result of a previously processed batch (idempotent replay)."""
+    payload = batch.result_payload()
+    payload["idempotent_replay"] = True
+    return payload
+
+
+def annotate_batch(ids, status, note=None, annotator=None, level=None, batch_key=None):
+    """Batch annotation used by the exceedance work bench.
+
+    - 参数不合法 (如缺少说明) -> 422, 整批不生效;
+    - 单条记录不满足条件 (如不存在) -> 其余照常处理, 逐条返回失败原因;
+    - 携带相同 batch_key 的重复提交 -> 直接返回首次处理结果, 不重复写入.
+    """
+    note_text = (note or "").strip()
+    annotator_text = (annotator or "").strip()
+
+    if status not in STATUS_CHOICES:
+        raise ValidationError(
+            "标注状态取值不合法, 可选: %s" % ", ".join(STATUS_CHOICES),
+            fields={"status": "unknown"},
+        )
+    if level is not None and level not in LEVEL_CHOICES:
+        raise ValidationError(
+            "超标等级取值不合法, 可选: %s" % ", ".join(LEVEL_CHOICES),
+            fields={"level": "unknown"},
+        )
+    if status != "pending" and not note_text:
+        raise ValidationError(
+            "批量标注为\"%s\"时必须填写标注说明" % EXCEEDANCE_STATUS_LABELS[status],
+            fields={"note": "required"},
+        )
+
+    try:
+        ids = list(dict.fromkeys(int(item) for item in ids))
+    except (TypeError, ValueError):
+        raise ValidationError("ids 必须是整数数组", fields={"ids": "invalid"})
     if not ids:
         raise ValidationError("请至少选择一条超标记录", fields={"ids": "empty"})
 
-    records = Exceedance.query.filter(Exceedance.id.in_(ids)).all()
-    found = {record.id for record in records}
-    missing = [item for item in ids if item not in found]
+    if batch_key:
+        existing = AnnotationBatch.query.filter_by(batch_key=batch_key).first()
+        if existing is not None:
+            return _replay_result(existing)
 
-    updated = []
-    for record in records:
-        annotate_silent = {
-            "status": status if status is not None else record.status,
-            "level": level if level is not None else record.level,
-            "note": note,
-            "annotator": annotator,
-        }
-        if annotate_silent["status"] != "pending" and not (note or "").strip():
-            raise ValidationError(
-                "批量标注为\"%s\"时必须填写标注说明"
-                % EXCEEDANCE_STATUS_LABELS.get(annotate_silent["status"], annotate_silent["status"]),
-                fields={"note": "required"},
-            )
-        record.status = annotate_silent["status"]
-        record.level = annotate_silent["level"]
-        if (note or "").strip():
-            record.note = note.strip()
-        if annotate_silent["status"] == "pending":
+    records = Exceedance.query.filter(Exceedance.id.in_(ids)).all()
+    found = {record.id: record for record in records}
+
+    batch = None
+    if batch_key:
+        batch = AnnotationBatch(
+            batch_key=batch_key,
+            status=status,
+            level=level,
+            note=note_text or None,
+            annotator=annotator_text or None,
+        )
+        db.session.add(batch)
+
+    updated_ids = []
+    failed = []
+    reannotated = 0
+    now = datetime.now()
+    for item in ids:
+        record = found.get(item)
+        if record is None:
+            failed.append({"id": item, "reason": "记录不存在或已被删除"})
+            continue
+        prev = _snapshot(record)
+        if prev["status"] != "pending" or record.annotated_at is not None:
+            reannotated += 1
+        record.status = status
+        if level is not None:
+            record.level = level
+        if note_text:
+            record.note = note_text
+        if status == "pending":
             record.annotated_at = None
         else:
-            record.annotator = annotator or record.annotator or "未署名"
-            record.annotated_at = datetime.now()
-        updated.append(record.id)
+            record.annotator = annotator_text or record.annotator or "未署名"
+            record.annotated_at = now
+        _record_history(
+            record,
+            prev,
+            source="batch",
+            batch=batch,
+            note=note_text or None,
+            annotator=annotator_text or None,
+        )
+        updated_ids.append(item)
 
-    db.session.commit()
-    return {"updated": len(updated), "updated_ids": updated, "missing": missing}
+    result = {
+        "batch_id": batch_key,
+        "idempotent_replay": False,
+        "status": status,
+        "requested": len(ids),
+        "updated": len(updated_ids),
+        "updated_ids": updated_ids,
+        "failed": failed,
+        "missing": [item["id"] for item in failed],
+        "reannotated": reannotated,
+        "annotator": annotator_text or None,
+        "note": note_text or None,
+        "processed_at": iso(now),
+    }
+
+    if batch is not None:
+        batch.requested = result["requested"]
+        batch.updated = result["updated"]
+        batch.failed = len(failed)
+        batch.reannotated = reannotated
+        batch.result = json.dumps(
+            {key: value for key, value in result.items() if key != "idempotent_replay"},
+            ensure_ascii=False,
+        )
+
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # 并发下同一 batch_key 已被其他请求写入: 回滚后按幂等重放处理
+        db.session.rollback()
+        if batch_key:
+            existing = AnnotationBatch.query.filter_by(batch_key=batch_key).first()
+            if existing is not None:
+                return _replay_result(existing)
+        raise
+    return result
+
+
+def annotation_history(exceedance_id, limit=50):
+    """单条记录的标注历史 (新→旧), 含每次标注的前后值对照."""
+    get_exceedance(exceedance_id)
+    entries = (
+        ExceedanceAnnotation.query.filter_by(exceedance_id=exceedance_id)
+        .order_by(ExceedanceAnnotation.created_at.desc(), ExceedanceAnnotation.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"items": [entry.to_dict() for entry in entries], "total": len(entries)}
+
+
+def recent_batches(limit=20):
+    """最近的批量标注操作记录 (操作人/说明/结果), 供工作台留痕展示."""
+    try:
+        limit = min(max(int(limit or 20), 1), 100)
+    except (TypeError, ValueError):
+        limit = 20
+    batches = (
+        AnnotationBatch.query.order_by(AnnotationBatch.created_at.desc(), AnnotationBatch.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"items": [batch.to_dict() for batch in batches], "total": len(batches)}
 
 
 def summary(args):

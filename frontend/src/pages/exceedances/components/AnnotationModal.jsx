@@ -8,6 +8,7 @@ import { useToast } from '../../../components/common/ToastProvider.jsx'
 import { EXCEEDANCE_LEVEL_TONE, EXCEEDANCE_STATUS_TONE } from '../../../constants/index.js'
 import { useAsyncData } from '../../../hooks/useAsyncData.js'
 import { formatDateTime, formatNumber, formatRatio } from '../../../utils/format.js'
+import AnnotationHistory from './AnnotationHistory.jsx'
 
 const STATUS_CHOICES = [
   { value: 'confirmed', label: '确认超标', hint: '经复核确属超标, 需记录处置说明' },
@@ -119,6 +120,8 @@ export default function AnnotationModal({ exceedanceId, onClose, onSaved }) {
           </dl>
 
           {message ? <Alert tone="error">{message}</Alert> : null}
+
+          <AnnotationHistory exceedanceId={exceedanceId} />
 
           <Field label="标注结论" required error={errors.status}>
             <div className="stack">
